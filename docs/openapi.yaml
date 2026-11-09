@@ -1,0 +1,334 @@
+openapi: 3.0.3
+info:
+  title: QMe API
+  version: 1.0.0
+  description: |
+    Create quotes in QMe from your ERP, billing tool or website, and send them to your customers.
+
+    * Quotes are made as **drafts**. Nothing reaches a customer until you call the send endpoint with a key that is allowed to send.
+    * A key acts as the person who created it: quotes belong to that person, and a member's key only sees that member's quotes.
+    * Money is in rupees (INR). Tax is worked out with the same engine as the QMe app, from your GSTIN and the buyer's state.
+    * Every error has the same shape: `{ "error": { "code", "message", "details"? } }`.
+
+    Limits: 60 requests a minute per key, 100 emails a day per key, 1 MB per request, 200 lines per quote, 5000 products per catalogue import.
+servers:
+  - url: https://bjodkoppwjyoyabolchf.supabase.co/functions/v1/v1
+    description: Staging (production address to be added at launch)
+security:
+  - ApiKey: []
+tags:
+  - { name: Quotes, description: 'Create, read and send quotes' }
+  - { name: Catalogue, description: 'Keep your product list in step with your own system' }
+paths:
+  /quotes:
+    post:
+      tags: [Quotes]
+      operationId: createQuote
+      summary: Create a draft quote (or update the draft for the same external_ref)
+      description: |
+        Needs the `quotes:write` permission. Each line is matched to your catalogue (by `product_id`, then `sku`, then name). A line is only
+        matched automatically when the match is very sure; a different size never matches ("Beaker 100ml" is not "Beaker 250ml"). A line that
+        cannot be placed and has no `unit_price` refuses the **whole** request with a 422 that lists the closest catalogue names; nothing is saved.
+        A line with a `unit_price` that is not in your catalogue becomes a custom line.
+
+        The buyer is also saved in your Clients list (found by phone, email, GSTIN, then name; never overwriting what is already saved),
+        tagged source "API".
+
+        Send the same `external_ref` again to update the same draft (its number stays). A quote that has been sent cannot be changed this way.
+        With `dry_run: true` nothing is saved and you get the preview: matches, tax and totals.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteRequest' }
+            example:
+              external_ref: ERP-1001
+              customer: { name: Acme Labs, phone: '9876543210', email: buyer@acme.in, state: Tamil Nadu }
+              lines:
+                - { sku: PIP-10, quantity: 10 }
+                - { name: Beaker 250ml, quantity: 2, discount_pct: 10 }
+                - { name: Custom fabrication, quantity: 1, unit_price: 5000, gst_rate: 12 }
+      responses:
+        '201': { description: Draft created, content: { application/json: { schema: { $ref: '#/components/schemas/QuoteResult' } } } }
+        '200': { description: 'Existing draft updated (same external_ref), or a dry-run preview', content: { application/json: { schema: { $ref: '#/components/schemas/QuoteResult' } } } }
+        '400': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /quotes/{id}:
+    get:
+      tags: [Quotes]
+      operationId: getQuote
+      summary: Get a quote with its lines, status and totals
+      description: Needs `quotes:read`. A sent quote shows the total that was frozen when it was sent. The customer link is not returned here (it is shown once, when you send).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: The quote, content: { application/json: { schema: { $ref: '#/components/schemas/Quote' } } } }
+        '400': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /quotes/{id}/send:
+    post:
+      tags: [Quotes]
+      operationId: sendQuote
+      summary: Send a draft quote to its customer by email, or get its WhatsApp message
+      description: |
+        Needs `quotes:send`, which is **off by default** on a new key. There is no recipient field: an email always goes to the customer
+        email saved on the quote, in your company's name (replies go to you). QMe does not send WhatsApp messages; with `whatsapp` you get
+        the text and a click-to-chat link to send yourself.
+
+        The whole send is one step: approval check, draft to sent, totals frozen, customer link made. If the key was made by a **member** and the quote needs
+        an admin's approval, the response is `202 pending_approval` and an admin is alerted in QMe; send again once it is approved.
+        If the email provider fails after the quote was marked sent, you get `502 email_failed` with the `public_url` so nothing is lost.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SendRequest' } } }
+      responses:
+        '200': { description: Sent, content: { application/json: { schema: { $ref: '#/components/schemas/SendResult' } } } }
+        '202': { description: Waiting for an admin's approval in QMe, content: { application/json: { schema: { $ref: '#/components/schemas/PendingApproval' } } } }
+        '400': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { description: 'The quote was marked sent but the email could not be delivered', content: { application/json: { schema: { $ref: '#/components/schemas/EmailFailed' } } } }
+        '503': { description: Email is not configured for this project, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /catalogue/import:
+    post:
+      tags: [Catalogue]
+      operationId: importCatalogue
+      summary: Create and update products from your product list
+      description: |
+        Needs `catalogue:write` and a key made by an **admin** (the catalogue is shared by the whole company). Rows are matched by `sku`, then by exact name,
+        and only the fields a row carries are changed. **Nothing is ever deleted.** With `mark_missing_inactive`, products that an earlier import brought in
+        but this file leaves out stop being matched by the API (they stay in QMe and on old quotes). The import is all or nothing; `dry_run` shows exactly what
+        a real import would do, including plan limits, and saves nothing.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CatalogueImportRequest' } } }
+      responses:
+        '200': { description: Result, content: { application/json: { schema: { $ref: '#/components/schemas/CatalogueImportResult' } } } }
+        '400': { $ref: '#/components/responses/Validation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+components:
+  securitySchemes:
+    ApiKey: { type: apiKey, in: header, name: X-API-Key, description: 'Create a key in QMe under API keys (admins only). It is shown once.' }
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 200 }
+      description: |
+        Makes a retry safe. The same key with the same request returns the first result again (header `Idempotent-Replayed: true`);
+        the same key with a different request is `422 idempotency_key_reuse`. Kept for 24 hours. Server errors (5xx) are not stored, so you can retry.
+  schemas:
+    QuoteRequest:
+      type: object
+      required: [customer, lines]
+      properties:
+        external_ref: { type: string, maxLength: 100, description: 'Your own id for this quote. The same value updates the same draft.' }
+        customer: { $ref: '#/components/schemas/Customer' }
+        lines: { type: array, minItems: 1, maxItems: 200, items: { $ref: '#/components/schemas/LineRequest' } }
+        valid_days: { type: integer, minimum: 1, maximum: 365, default: 30 }
+        notes: { type: string, maxLength: 2000 }
+        dry_run: { type: boolean, default: false }
+    Customer:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 200 }
+        phone: { type: string, description: '10-digit Indian mobile, +91 allowed' }
+        email: { type: string, format: email }
+        gstin: { type: string, description: 'Validated, including the check character' }
+        state: { type: string, description: 'State name, or its GST code (e.g. "Tamil Nadu" or "33"). Decides same-state or other-state tax; taken from the GSTIN if you give one.' }
+        address: { type: string, maxLength: 500 }
+    LineRequest:
+      type: object
+      description: 'Give at least one of product_id, sku or name.'
+      properties:
+        product_id: { type: string, format: uuid }
+        sku: { type: string, maxLength: 60 }
+        name: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 1000 }
+        quantity: { type: number, minimum: 0.001, maximum: 100000, description: 'More than 0, up to 3 decimals' }
+        unit: { type: string, maxLength: 20 }
+        unit_price: { type: number, minimum: 0, description: 'Rupees, up to 2 decimals. Needed for a line that is not in your catalogue; overrides the catalogue price otherwise.' }
+        discount_pct: { type: number, minimum: 0, maximum: 100 }
+        gst_rate: { type: number, enum: [0, 0.25, 3, 5, 12, 18, 28], description: 'Percent' }
+        hsn_code: { type: string, description: '4, 6 or 8 digits' }
+      required: [quantity]
+    Totals:
+      type: object
+      properties:
+        subtotal: { type: number }
+        discount: { type: number }
+        taxable: { type: number }
+        cgst: { type: number }
+        sgst: { type: number }
+        igst: { type: number }
+        cess: { type: number }
+        tax: { type: number }
+        round_off: { type: number }
+        total: { type: number }
+        total_paise: { type: integer }
+        currency: { type: string, example: INR }
+    LineReport:
+      type: object
+      properties:
+        index: { type: integer }
+        description: { type: string }
+        quantity: { type: number }
+        unit: { type: string }
+        unit_price: { type: number }
+        discount_pct: { type: number }
+        gst_rate: { type: number }
+        hsn_code: { type: string, nullable: true }
+        line_total: { type: number }
+        matched:
+          nullable: true
+          type: object
+          description: 'null for a custom line'
+          properties:
+            product_id: { type: string, format: uuid }
+            sku: { type: string, nullable: true }
+            by: { type: string, enum: [product_id, sku, name] }
+            score: { type: number }
+        suggestions:
+          type: array
+          items: { type: object, properties: { product_id: { type: string }, name: { type: string }, sku: { type: string, nullable: true }, unit_price: { type: number }, score: { type: number } } }
+    QuoteResult:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        quote_number: { type: string }
+        status: { type: string, example: draft }
+        external_ref: { type: string, nullable: true }
+        created: { type: boolean, description: 'false when an existing draft was updated' }
+        customer: { type: object, properties: { id: { type: string, nullable: true }, name: { type: string }, created: { type: boolean }, linked: { type: boolean } } }
+        tax_type: { type: string, enum: [intra_state, inter_state] }
+        place_of_supply_state_code: { type: string, nullable: true }
+        valid_until: { type: string, format: date }
+        lines: { type: array, items: { $ref: '#/components/schemas/LineReport' } }
+        totals: { $ref: '#/components/schemas/Totals' }
+        warnings: { type: array, items: { type: string } }
+        dry_run: { type: boolean, description: 'Present (true) on a dry run, which returns quote_preview instead of the saved quote' }
+        quote_preview: { type: object }
+    Quote:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        quote_number: { type: string }
+        status: { type: string, enum: [draft, sent, viewed, accepted, declined, changes_requested, expired, revised] }
+        approval_status: { type: string }
+        external_ref: { type: string, nullable: true }
+        customer: { type: object, properties: { id: { type: string, nullable: true }, name: { type: string }, email: { type: string, nullable: true }, phone: { type: string, nullable: true } } }
+        place_of_supply_state_code: { type: string, nullable: true }
+        tax_type: { type: string }
+        valid_until: { type: string, format: date, nullable: true }
+        notes: { type: string, nullable: true }
+        lines: { type: array, items: { $ref: '#/components/schemas/LineReport' } }
+        totals: { $ref: '#/components/schemas/Totals' }
+        created_at: { type: string, format: date-time }
+        sent_at: { type: string, format: date-time, nullable: true }
+        sent_via: { type: string, nullable: true }
+    SendRequest:
+      type: object
+      required: [channel]
+      properties:
+        channel: { type: string, enum: [email, whatsapp] }
+        message: { type: string, maxLength: 1000, description: 'whatsapp only: the opening line before the link' }
+        expires_in_days: { type: integer, minimum: 1, maximum: 90, default: 30, description: 'How long the customer link works' }
+    SendResult:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        quote_number: { type: string }
+        status: { type: string, example: sent }
+        channel: { type: string, enum: [email, whatsapp] }
+        sent_to: { type: string, nullable: true }
+        public_url: { type: string, description: 'The customer link. Shown only now.' }
+        link_expires_at: { type: string, format: date-time }
+        totals_frozen: { type: boolean }
+        message_text: { type: string, description: whatsapp only }
+        wa_link: { type: string, description: whatsapp only }
+    PendingApproval:
+      type: object
+      properties: { id: { type: string }, quote_number: { type: string }, status: { type: string, example: pending_approval }, message: { type: string } }
+    EmailFailed:
+      type: object
+      properties:
+        error:
+          type: object
+          properties: { code: { type: string, example: email_failed }, message: { type: string }, quote_id: { type: string }, status: { type: string, example: sent }, public_url: { type: string } }
+    CatalogueImportRequest:
+      type: object
+      required: [products]
+      properties:
+        products:
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items:
+            type: object
+            required: [name, unit_price]
+            properties:
+              sku: { type: string, maxLength: 60 }
+              name: { type: string, maxLength: 200 }
+              unit: { type: string }
+              unit_price: { type: number, minimum: 0 }
+              hsn_code: { type: string }
+              gst_rate: { type: number, enum: [0, 0.25, 3, 5, 12, 18, 28] }
+              category: { type: string }
+        dry_run: { type: boolean, default: false }
+        mark_missing_inactive: { type: boolean, default: false }
+    CatalogueImportResult:
+      type: object
+      properties:
+        dry_run: { type: boolean }
+        created: { type: integer }
+        updated: { type: integer }
+        unchanged: { type: integer }
+        reactivated: { type: integer }
+        marked_inactive: { type: integer }
+        rows: { type: array, items: { type: object, properties: { row: { type: integer }, action: { type: string, enum: [created, updated, unchanged] }, product_id: { type: string }, sku: { type: string, nullable: true }, name: { type: string } } } }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_api_key, missing_scope, key_creator_inactive, validation_error, not_found, conflict, unprocessable, idempotency_key_reuse, request_in_progress, rate_limited, daily_email_limit, method_not_allowed, payload_too_large, email_failed, email_not_configured, internal_error]
+            message: { type: string }
+            details: { type: array, items: { type: object, properties: { path: { type: string, example: 'lines[2].quantity' }, message: { type: string } } } }
+  responses:
+    Validation: { description: 'The request is not valid. details lists every problem with its path.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unauthorized: { description: 'invalid_api_key: missing, wrong or revoked key (one message for all three)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Forbidden: { description: 'missing_scope (the key lacks the permission) or key_creator_inactive (the person who made the key was switched off)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: 'Quote not found (also returned for another company''s quote, or a member key asking for someone else''s)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: 'The quote is not in a state that allows this (for example already sent), or an idempotent request is still running', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    TooLarge: { description: 'Body over 1 MB', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unprocessable: { description: 'Understood but cannot be done: lines that cannot be placed, plan limit reached, blocked address, idempotency key reused', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    RateLimited: { description: 'rate_limited or daily_email_limit. Wait for Retry-After seconds.', headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
